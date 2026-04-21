@@ -1,0 +1,243 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#define TEMP_PIN 4
+#define VIB_PIN 5
+#define VOLTAGE_PIN 35
+#define ENCODER_PIN 18
+#define RELAY_PIN 23
+
+#define SAMPLES 1000
+#define PPR 400
+
+float voltageCalibration = 0.46;
+
+volatile long pulseCount = 0;
+
+bool relayState = false;
+bool started = false;   // telemetry start flag
+
+const char* ssid = "motor";
+const char* wifi_password = "123456789";
+
+const char* mqtt_server = "b430c21bbccd4810b64214467105b56e.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "admin";
+const char* mqtt_password = "Admin123";
+
+const char* telemetry_topic = "motor_guardian/telemetry";
+const char* relay_topic = "motor_guardian/relay";
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature sensors(&oneWire);
+
+void IRAM_ATTR encoderISR()
+{
+  pulseCount++;
+}
+
+/* MQTT CALLBACK */
+
+void callback(char* topic, byte* payload, unsigned int length)
+{
+  String message = "";
+
+  for (int i = 0; i < length; i++)
+  {
+    message += (char)payload[i];
+  }
+
+  Serial.print("MQTT Message: ");
+  Serial.println(message);
+
+  if (String(topic) == relay_topic)
+  {
+    if (message.indexOf("true") != -1)
+    {
+      digitalWrite(RELAY_PIN, LOW);
+      relayState = true;
+      started = true;
+      Serial.println("Relay ON");
+    }
+
+    if (message.indexOf("false") != -1)
+    {
+      digitalWrite(RELAY_PIN, HIGH);
+      relayState = false;
+      Serial.println("Relay OFF");
+    }
+  }
+}
+
+/* MQTT CONNECT */
+
+void connectMQTT()
+{
+  while (!client.connected())
+  {
+    Serial.print("Connecting MQTT...");
+
+    if (client.connect("ESP32Motor", mqtt_user, mqtt_password))
+    {
+      Serial.println("Connected");
+      client.subscribe(relay_topic);
+    }
+    else
+    {
+      Serial.println("Retry...");
+      delay(2000);
+    }
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(VIB_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(ENCODER_PIN, INPUT_PULLUP);
+
+  digitalWrite(RELAY_PIN, HIGH); // relay OFF initially
+
+  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, RISING);
+
+  sensors.begin();
+
+  WiFi.begin(ssid, wifi_password);
+
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected");
+
+  espClient.setInsecure();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+}
+
+void loop()
+{
+  if (!client.connected()) connectMQTT();
+
+  client.loop();
+
+  if (started == false) return;  // no telemetry before relay first ON
+
+  /* TEMPERATURE */
+
+  sensors.requestTemperatures();
+  float temperature = sensors.getTempCByIndex(0);
+
+  /* VIBRATION */
+
+  int vibration = digitalRead(VIB_PIN);
+
+  /* VOLTAGE */
+
+  long offsetV = 0;
+
+  for(int i=0;i<SAMPLES;i++)
+  {
+    offsetV += analogRead(VOLTAGE_PIN);
+  }
+
+  offsetV /= SAMPLES;
+
+  long sumV = 0;
+
+  for(int i=0;i<SAMPLES;i++)
+  {
+    int value = analogRead(VOLTAGE_PIN) - offsetV;
+    sumV += value * value;
+  }
+
+  float Vrms = sqrt(sumV / SAMPLES);
+  float voltage = Vrms * voltageCalibration;
+
+  if(voltage < 20) voltage = 0;
+
+  /* AUTO RELAY CONTROL */
+
+  if(voltage > 130)
+  {
+    digitalWrite(RELAY_PIN, HIGH);
+    relayState = false;
+    Serial.println("Over Voltage - Relay OFF");
+  }
+  else
+  {
+    digitalWrite(RELAY_PIN, LOW);
+    relayState = true;
+  }
+
+  /* CURRENT (temporary simulated) */
+
+  float current = 1.0 + (random(-30,30)/100.0);
+
+  /* RPM */
+
+  static unsigned long lastTime = 0;
+  static float rpm = 0;
+
+  if(millis() - lastTime >= 1000)
+  {
+    long count = pulseCount;
+    pulseCount = 0;
+
+    rpm = (count * 60.0) / (PPR * 4);
+
+    lastTime = millis();
+  }
+
+  /* SERIAL */
+
+  Serial.println("------ TELEMETRY ------");
+
+  Serial.print("Temp: ");
+  Serial.println(temperature);
+
+  Serial.print("Voltage: ");
+  Serial.println(voltage);
+
+  Serial.print("Current: ");
+  Serial.println(current);
+
+  Serial.print("RPM: ");
+  Serial.println(rpm);
+
+  Serial.print("Vibration: ");
+  Serial.println(vibration);
+
+  Serial.print("Relay State: ");
+  Serial.println(relayState);
+
+  /* MQTT PAYLOAD */
+
+  String payload = "{";
+  payload += "\"temperature\":" + String(temperature) + ",";
+  payload += "\"voltage\":" + String(voltage) + ",";
+  payload += "\"current\":" + String(current) + ",";
+  payload += "\"rpm\":" + String(rpm) + ",";
+  payload += "\"vibration\":" + String(vibration) + ",";
+  payload += "\"relay\":" + String(relayState);
+  payload += "}";
+
+  client.publish(telemetry_topic, payload.c_str());
+
+  Serial.println("Data Sent to MQTT");
+
+  delay(2000);
+}
